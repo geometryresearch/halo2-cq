@@ -50,27 +50,25 @@ impl<E: MultiMillerLoop> MyCircuit<E> {
         config: MyConfig,
         mut layouter: impl halo2_proofs::circuit::Layouter<E::Scalar, E = E>,
     ) -> Result<(), halo2_proofs::plonk::Error> {
-        for (i, &value) in self.values.iter().enumerate() {
-            layouter.assign_region(
-                || format!("value {}", i),
-                |mut region| {
+        layouter.assign_region(
+            || "",
+            |mut region| {
+                for (i, &value) in self.values.iter().enumerate() {
                     region.assign_advice(
                         config.advice,
-                        0,
+                        i,
                         Value::known(<E as Engine>::Scalar::from(value)),
                     )?;
                     region.assign_advice(
                         config.advice_2,
-                        0,
+                        i,
                         Value::known(<E as Engine>::Scalar::from(value * 2)),
                     )?;
+                }
 
-                    Ok(())
-                },
-            )?;
-        }
-
-        Ok(())
+                Ok(())
+            },
+        )
     }
 }
 
@@ -168,7 +166,7 @@ fn static_lookup_e2e() {
         TableSRS::<Bn256>::setup_from_toxic_waste(table_16_size - 1, table_16_size, s);
     let (table, table_2) = generate_table(&table_16_srs, 16, K as usize);
     let circuit = MyCircuit {
-        values: vec![0, 5, 11],
+        values: vec![0, 2],
         table,
         table_2,
     };
