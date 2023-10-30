@@ -35,7 +35,7 @@ pub struct VerifierSHPLONK<'params, E: Engine> {
     params: &'params ParamsKZG<E>,
 }
 
-impl<'params, E> Verifier<'params, KZGCommitmentScheme<E>> for VerifierSHPLONK<'params, E>
+impl<'params, E> Verifier<'params, E> for VerifierSHPLONK<'params, E>
 where
     E: MultiMillerLoop + Debug,
     E::G1Affine: SerdeCurveAffine,

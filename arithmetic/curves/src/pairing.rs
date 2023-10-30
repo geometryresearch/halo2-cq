@@ -1,9 +1,10 @@
-use crate::{CurveAffine, FieldExt, Group as _Group};
+use crate::{serde::SerdeObject, CurveAffine, FieldExt, Group as _Group};
 use core::ops::Mul;
 use group::{
     prime::PrimeCurve, Group, GroupOps, GroupOpsOwned, ScalarMul, ScalarMulOwned,
     UncompressedEncoding,
 };
+use std::fmt::Debug;
 
 pub trait Engine: Sized + 'static + Clone {
     /// This is the scalar field of the engine's groups.
@@ -34,7 +35,8 @@ pub trait Engine: Sized + 'static + Clone {
         + GroupOps<Self::G2Affine>
         + GroupOpsOwned<Self::G2Affine>
         + ScalarMul<Self::Scalar>
-        + ScalarMulOwned<Self::Scalar>;
+        + ScalarMulOwned<Self::Scalar>
+        + _Group<Scalar = Self::Scalar>;
 
     /// The affine representation of an element in G2.
     type G2Affine: PairingCurveAffine<

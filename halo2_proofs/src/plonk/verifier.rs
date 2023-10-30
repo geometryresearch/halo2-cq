@@ -1,43 +1,54 @@
 use ff::Field;
 use group::Curve;
+use halo2curves::batch_pairing::PairingBatcher;
 use rand_core::RngCore;
+use std::fmt::Debug;
 use std::iter;
 
 use super::{
-    vanishing, ChallengeBeta, ChallengeGamma, ChallengeTheta, ChallengeX, ChallengeY, Error,
-    VerifyingKey,
+    static_lookup, vanishing, ChallengeBeta, ChallengeGamma, ChallengeTheta, ChallengeX,
+    ChallengeY, Error, VerifyingKey,
 };
 use crate::arithmetic::{compute_inner_product, CurveAffine, FieldExt};
 use crate::poly::commitment::{CommitmentScheme, Verifier};
+use crate::poly::kzg::commitment::KZGCommitmentScheme;
 use crate::poly::VerificationStrategy;
 use crate::poly::{
     commitment::{Blind, Params, MSM},
     Guard, VerifierQuery,
 };
-use crate::transcript::{read_n_points, read_n_scalars, EncodedChallenge, TranscriptRead};
+use crate::transcript::{
+    read_n_points, read_n_scalars, ChallengeScalar, EncodedChallenge, TranscriptRead,
+};
+use halo2curves::pairing::MultiMillerLoop;
+use halo2curves::serde::SerdeObject;
 
-#[cfg(feature = "batch")]
-mod batch;
-#[cfg(feature = "batch")]
-pub use batch::BatchVerifier;
+// #[cfg(feature = "batch")]
+// mod batch;
+// #[cfg(feature = "batch")]
+// pub use batch::BatchVerifier;
 
 use crate::poly::commitment::ParamsVerifier;
 
 /// Returns a boolean indicating whether or not the proof is valid
 pub fn verify_proof<
     'params,
-    Scheme: CommitmentScheme,
-    V: Verifier<'params, Scheme>,
-    E: EncodedChallenge<Scheme::Curve>,
-    T: TranscriptRead<Scheme::Curve, E>,
-    Strategy: VerificationStrategy<'params, Scheme, V>,
+    E: MultiMillerLoop + Debug,
+    V: Verifier<'params, E>,
+    EC: EncodedChallenge<E::G1Affine>,
+    T: TranscriptRead<E::G1Affine, EC>,
+    Strategy: VerificationStrategy<'params, E, V, Output = Strategy>,
 >(
-    params: &'params Scheme::ParamsVerifier,
-    vk: &VerifyingKey<Scheme::Curve>,
+    params: &'params <KZGCommitmentScheme<E> as CommitmentScheme>::ParamsVerifier,
+    vk: &VerifyingKey<E>,
     strategy: Strategy,
-    instances: &[&[&[Scheme::Scalar]]],
+    instances: &[&[&[E::Scalar]]],
     transcript: &mut T,
-) -> Result<Strategy::Output, Error> {
+) -> Result<PairingBatcher<E>, Error>
+where
+    E::G1Affine: SerdeObject,
+    E::G2Affine: SerdeObject,
+{
     // Check that instances matches the expected number of instance columns
     for instances in instances.iter() {
         if instances.len() != vk.cs.num_instance_columns {
@@ -56,7 +67,7 @@ pub fn verify_proof<
                             return Err(Error::InstanceTooLarge);
                         }
                         let mut poly = instance.to_vec();
-                        poly.resize(params.n() as usize, Scheme::Scalar::zero());
+                        poly.resize(params.n() as usize, E::Scalar::zero());
                         let poly = vk.domain.lagrange_from_vec(poly);
 
                         Ok(params.commit_lagrange(&poly, Blind::default()).to_affine())
@@ -93,8 +104,8 @@ pub fn verify_proof<
     // Hash the prover's advice commitments into the transcript and squeeze challenges
     let (advice_commitments, challenges) = {
         let mut advice_commitments =
-            vec![vec![Scheme::Curve::default(); vk.cs.num_advice_columns]; num_proofs];
-        let mut challenges = vec![Scheme::Scalar::zero(); vk.cs.num_challenges];
+            vec![vec![E::G1Affine::default(); vk.cs.num_advice_columns]; num_proofs];
+        let mut challenges = vec![E::Scalar::zero(); vk.cs.num_challenges];
 
         for current_phase in vk.cs.phases() {
             for advice_commitments in advice_commitments.iter_mut() {
@@ -133,6 +144,17 @@ pub fn verify_proof<
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let static_lookups = (0..num_proofs)
+        .map(|_| -> Result<Vec<_>, _> {
+            // Hash each static lookup commitment
+            vk.cs
+                .static_lookups
+                .iter()
+                .map(|lookup| lookup.read_committed(transcript))
+                .collect::<Result<Vec<static_lookup::verifier::CommittedWitness<E>>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     // Sample beta challenge
     let beta: ChallengeBeta<_> = transcript.squeeze_challenge_scalar();
 
@@ -157,6 +179,16 @@ pub fn verify_proof<
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let static_lookups = static_lookups
+        .into_iter()
+        .map(|lookups| {
+            lookups
+                .into_iter()
+                .map(|lookup| lookup.read_committed_log_derivative(transcript))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     let vanishing = vanishing::Argument::read_commitments_before_y(transcript)?;
 
     // Sample y challenge, which keeps the gates linearly independent.
@@ -167,6 +199,7 @@ pub fn verify_proof<
     // Sample x challenge, which is used to ensure the circuit is
     // satisfied with high probability.
     let x: ChallengeX<_> = transcript.squeeze_challenge_scalar();
+
     let instance_evals = if V::QUERY_INSTANCE {
         (0..num_proofs)
             .map(|_| -> Result<Vec<_>, _> {
@@ -239,6 +272,16 @@ pub fn verify_proof<
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let static_lookups = static_lookups
+        .into_iter()
+        .map(|lookups| -> Result<Vec<_>, _> {
+            lookups
+                .into_iter()
+                .map(|lookup| lookup.evaluate(transcript))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     // This check ensures the circuit is satisfied so long as the polynomial
     // commitments open to the correct values.
     let vanishing = {
@@ -251,9 +294,9 @@ pub fn verify_proof<
             .l_i_range(*x, xn, (-((blinding_factors + 1) as i32))..=0);
         assert_eq!(l_evals.len(), 2 + blinding_factors);
         let l_last = l_evals[0];
-        let l_blind: Scheme::Scalar = l_evals[1..(1 + blinding_factors)]
+        let l_blind: E::Scalar = l_evals[1..(1 + blinding_factors)]
             .iter()
-            .fold(Scheme::Scalar::zero(), |acc, eval| acc + eval);
+            .fold(E::Scalar::zero(), |acc, eval| acc + eval);
         let l_0 = l_evals[1 + blinding_factors];
 
         // Compute the expected value of h(x)
@@ -262,63 +305,74 @@ pub fn verify_proof<
             .zip(instance_evals.iter())
             .zip(permutations_evaluated.iter())
             .zip(lookups_evaluated.iter())
-            .flat_map(|(((advice_evals, instance_evals), permutation), lookups)| {
-                let challenges = &challenges;
-                let fixed_evals = &fixed_evals;
-                std::iter::empty()
-                    // Evaluate the circuit using the custom gates provided
-                    .chain(vk.cs.gates.iter().flat_map(move |gate| {
-                        gate.polynomials().iter().map(move |poly| {
-                            poly.evaluate(
-                                &|scalar| scalar,
-                                &|_| panic!("virtual selectors are removed during optimization"),
-                                &|query| fixed_evals[query.index],
-                                &|query| advice_evals[query.index],
-                                &|query| instance_evals[query.index],
-                                &|challenge| challenges[challenge.index()],
-                                &|a| -a,
-                                &|a, b| a + &b,
-                                &|a, b| a * &b,
-                                &|a, scalar| a * &scalar,
-                            )
-                        })
-                    }))
-                    .chain(permutation.expressions(
-                        vk,
-                        &vk.cs.permutation,
-                        &permutations_common,
-                        advice_evals,
-                        fixed_evals,
-                        instance_evals,
-                        l_0,
-                        l_last,
-                        l_blind,
-                        beta,
-                        gamma,
-                        x,
-                    ))
-                    .chain(
-                        lookups
-                            .iter()
-                            .zip(vk.cs.lookups.iter())
-                            .flat_map(move |(p, argument)| {
-                                p.expressions(
-                                    l_0,
-                                    l_last,
-                                    l_blind,
-                                    argument,
-                                    theta,
-                                    beta,
-                                    gamma,
-                                    advice_evals,
-                                    fixed_evals,
-                                    instance_evals,
-                                    challenges,
+            .zip(static_lookups.iter())
+            .flat_map(
+                |((((advice_evals, instance_evals), permutation), lookups), static_lookups)| {
+                    let challenges = &challenges;
+                    let fixed_evals = &fixed_evals;
+                    std::iter::empty()
+                        // Evaluate the circuit using the custom gates provided
+                        .chain(vk.cs.gates.iter().flat_map(move |gate| {
+                            gate.polynomials().iter().map(move |poly| {
+                                poly.evaluate(
+                                    &|scalar| scalar,
+                                    &|_| {
+                                        panic!("virtual selectors are removed during optimization")
+                                    },
+                                    &|query| fixed_evals[query.index],
+                                    &|query| advice_evals[query.index],
+                                    &|query| instance_evals[query.index],
+                                    &|challenge| challenges[challenge.index()],
+                                    &|a| -a,
+                                    &|a, b| a + &b,
+                                    &|a, b| a * &b,
+                                    &|a, scalar| a * &scalar,
                                 )
                             })
-                            .into_iter(),
-                    )
-            });
+                        }))
+                        .chain(permutation.expressions(
+                            vk,
+                            &vk.cs.permutation,
+                            &permutations_common,
+                            advice_evals,
+                            fixed_evals,
+                            instance_evals,
+                            l_0,
+                            l_last,
+                            l_blind,
+                            beta,
+                            gamma,
+                            x,
+                        ))
+                        .chain(
+                            lookups
+                                .iter()
+                                .zip(vk.cs.lookups.iter())
+                                .flat_map(move |(p, argument)| {
+                                    p.expressions(
+                                        l_0,
+                                        l_last,
+                                        l_blind,
+                                        argument,
+                                        theta,
+                                        beta,
+                                        gamma,
+                                        advice_evals,
+                                        fixed_evals,
+                                        instance_evals,
+                                        challenges,
+                                    )
+                                })
+                                .into_iter(),
+                        )
+                        .chain(
+                            static_lookups
+                                .iter()
+                                .flat_map(move |p| p.expressions(vk, l_last, l_blind, beta, x))
+                                .into_iter(),
+                        )
+                },
+            );
 
         vanishing.verify(params, expressions, y, xn)
     };
@@ -330,13 +384,20 @@ pub fn verify_proof<
         .zip(advice_evals.iter())
         .zip(permutations_evaluated.iter())
         .zip(lookups_evaluated.iter())
+        .zip(static_lookups.iter())
         .flat_map(
             |(
                 (
-                    (((instance_commitments, instance_evals), advice_commitments), advice_evals),
-                    permutation,
+                    (
+                        (
+                            ((instance_commitments, instance_evals), advice_commitments),
+                            advice_evals,
+                        ),
+                        permutation,
+                    ),
+                    lookups,
                 ),
-                lookups,
+                static_lookups,
             )| {
                 iter::empty()
                     .chain(
@@ -355,16 +416,23 @@ pub fn verify_proof<
                     )
                     .chain(vk.cs.advice_queries.iter().enumerate().map(
                         move |(query_index, &(column, at))| {
-                            VerifierQuery::new_commitment(
+                            let verifier_advice_query = VerifierQuery::new_commitment(
                                 &advice_commitments[column.index()],
                                 vk.domain.rotate_omega(*x, at),
                                 advice_evals[query_index],
-                            )
+                            );
+                            verifier_advice_query
                         },
                     ))
                     .chain(permutation.queries(vk, x))
                     .chain(
                         lookups
+                            .iter()
+                            .flat_map(move |p| p.queries(vk, x))
+                            .into_iter(),
+                    )
+                    .chain(
+                        static_lookups
                             .iter()
                             .flat_map(move |p| p.queries(vk, x))
                             .into_iter(),
@@ -391,9 +459,31 @@ pub fn verify_proof<
     // polynomial commitments open to the correct values.
 
     let verifier = V::new(params);
-    strategy.process(|msm| {
+    let strategy = strategy.process(|msm| {
         verifier
             .verify_proof(transcript, queries, msm)
             .map_err(|_| Error::Opening)
-    })
+    })?;
+
+    // squeeze a challenge
+    let pairing_batcher_challenge: ChallengeScalar<_, ()> = transcript.squeeze_challenge_scalar();
+    let mut pairing_batcher: PairingBatcher<E> =
+        PairingBatcher::<E>::new(*pairing_batcher_challenge);
+
+    strategy.merge_with_pairing_batcher(&mut pairing_batcher);
+
+    // now register all static lookups pairings
+    let _ = static_lookups
+        .into_iter()
+        .map(|static_lookups| -> Result<Vec<_>, _> {
+            // Hash each lookup permuted commitment
+            static_lookups
+                .iter()
+                .map(|lookup| {
+                    lookup.register_pairings(&vk, params, &mut pairing_batcher, beta, theta)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(pairing_batcher)
 }

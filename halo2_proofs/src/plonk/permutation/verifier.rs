@@ -1,4 +1,7 @@
 use ff::Field;
+use halo2curves::pairing::MultiMillerLoop;
+use halo2curves::serde::SerdeObject;
+use std::fmt::Debug;
 use std::iter;
 
 use super::super::{circuit::Any, ChallengeBeta, ChallengeGamma, ChallengeX};
@@ -31,14 +34,18 @@ pub struct Evaluated<C: CurveAffine> {
 
 impl Argument {
     pub(crate) fn read_product_commitments<
-        C: CurveAffine,
-        E: EncodedChallenge<C>,
-        T: TranscriptRead<C, E>,
+        E: MultiMillerLoop + Debug,
+        EC: EncodedChallenge<E::G1Affine>,
+        T: TranscriptRead<E::G1Affine, EC>,
     >(
         &self,
-        vk: &plonk::VerifyingKey<C>,
+        vk: &plonk::VerifyingKey<E>,
         transcript: &mut T,
-    ) -> Result<Committed<C>, Error> {
+    ) -> Result<Committed<E::G1Affine>, Error>
+    where
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         let chunk_len = vk.cs_degree - 2;
 
         let permutation_product_commitments = self
@@ -99,9 +106,9 @@ impl<C: CurveAffine> Committed<C> {
 }
 
 impl<C: CurveAffine> Evaluated<C> {
-    pub(in crate::plonk) fn expressions<'a>(
+    pub(in crate::plonk) fn expressions<'a, E>(
         &'a self,
-        vk: &'a plonk::VerifyingKey<C>,
+        vk: &'a plonk::VerifyingKey<E>,
         p: &'a Argument,
         common: &'a CommonEvaluated<C>,
         advice_evals: &'a [C::Scalar],
@@ -113,7 +120,12 @@ impl<C: CurveAffine> Evaluated<C> {
         beta: ChallengeBeta<C>,
         gamma: ChallengeGamma<C>,
         x: ChallengeX<C>,
-    ) -> impl Iterator<Item = C::Scalar> + 'a {
+    ) -> impl Iterator<Item = C::Scalar> + 'a
+    where
+        E: MultiMillerLoop<G1Affine = C, Scalar = C::ScalarExt> + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         let chunk_len = vk.cs_degree - 2;
         iter::empty()
             // Enforce only for the first set.
@@ -199,11 +211,16 @@ impl<C: CurveAffine> Evaluated<C> {
             )
     }
 
-    pub(in crate::plonk) fn queries<'r, M: MSM<C> + 'r>(
+    pub(in crate::plonk) fn queries<'r, E, M: MSM<C> + 'r>(
         &'r self,
-        vk: &'r plonk::VerifyingKey<C>,
+        vk: &'r plonk::VerifyingKey<E>,
         x: ChallengeX<C>,
-    ) -> impl Iterator<Item = VerifierQuery<'r, C, M>> + Clone {
+    ) -> impl Iterator<Item = VerifierQuery<'r, C, M>> + Clone
+    where
+        E: MultiMillerLoop<G1Affine = C, Scalar = C::ScalarExt> + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         let blinding_factors = vk.cs.blinding_factors();
         let x_next = vk.domain.rotate_omega(*x, Rotation::next());
         let x_last = vk

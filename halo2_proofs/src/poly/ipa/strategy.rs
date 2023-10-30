@@ -114,7 +114,6 @@ impl<'params, C: CurveAffine>
     fn finalize(self) -> bool {
         self.msm.check()
     }
-}
 
 /// A verifier that checks single proof
 #[derive(Debug)]

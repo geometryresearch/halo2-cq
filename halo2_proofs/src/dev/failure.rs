@@ -3,6 +3,7 @@ use std::fmt;
 use std::iter;
 
 use group::ff::Field;
+use halo2curves::pairing::MultiMillerLoop;
 use halo2curves::FieldExt;
 
 use super::{
@@ -382,8 +383,8 @@ fn render_constraint_not_satisfied<F: Field>(
 ///     |   x0 = 0x5
 ///     |   x1 = 1
 /// ```
-fn render_lookup<F: FieldExt>(
-    prover: &MockProver<F>,
+fn render_lookup<F: FieldExt, E: MultiMillerLoop<Scalar = F>>(
+    prover: &MockProver<F, E>,
     name: &str,
     lookup_index: usize,
     location: &FailureLocation,
@@ -536,7 +537,10 @@ fn render_lookup<F: FieldExt>(
 
 impl VerifyFailure {
     /// Emits this failure in pretty-printed format to stderr.
-    pub(super) fn emit<F: FieldExt>(&self, prover: &MockProver<F>) {
+    pub(super) fn emit<F: FieldExt, E: MultiMillerLoop<Scalar = F>>(
+        &self,
+        prover: &MockProver<F, E>,
+    ) {
         match self {
             Self::CellNotAssigned {
                 gate,

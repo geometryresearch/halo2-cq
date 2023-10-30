@@ -14,7 +14,7 @@ use crate::transcript::{EncodedChallenge, TranscriptWrite};
 
 use ff::Field;
 use group::Curve;
-use halo2curves::pairing::Engine;
+use halo2curves::pairing::{Engine, MultiMillerLoop};
 use rand_core::RngCore;
 use std::fmt::Debug;
 use std::io::{self, Write};
@@ -27,7 +27,7 @@ pub struct ProverGWC<'params, E: Engine> {
 }
 
 /// Create a multi-opening proof
-impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>> for ProverGWC<'params, E>
+impl<'params, E: MultiMillerLoop + Debug> Prover<'params, E> for ProverGWC<'params, E>
 where
     E::G1Affine: SerdeCurveAffine,
     E::G2Affine: SerdeCurveAffine,

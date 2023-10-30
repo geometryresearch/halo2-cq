@@ -4,6 +4,7 @@ use std::{
 };
 
 use ff::PrimeField;
+use halo2curves::pairing::MultiMillerLoop;
 
 use crate::{
     dev::util,
@@ -103,7 +104,7 @@ pub struct CircuitGates {
 
 impl CircuitGates {
     /// Collects the gates from within the circuit.
-    pub fn collect<F: PrimeField, C: Circuit<F>>() -> Self {
+    pub fn collect<E: MultiMillerLoop, C: Circuit<E>>() -> Self {
         // Collect the graph details.
         let mut cs = ConstraintSystem::default();
         let _ = C::configure(&mut cs);

@@ -4,6 +4,7 @@
 
 mod arithmetic;
 
+pub mod batch_pairing;
 pub mod bn256;
 pub mod pairing;
 pub mod pasta;

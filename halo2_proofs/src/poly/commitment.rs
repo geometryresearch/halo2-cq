@@ -1,4 +1,5 @@
 use super::{
+    kzg::commitment::KZGCommitmentScheme,
     query::{ProverQuery, VerifierQuery},
     strategy::Guard,
     Coeff, LagrangeCoeff, Polynomial,
@@ -7,6 +8,8 @@ use crate::poly::Error;
 use crate::transcript::{EncodedChallenge, TranscriptRead, TranscriptWrite};
 use ff::Field;
 use group::Curve;
+use halo2curves::pairing::MultiMillerLoop;
+use halo2curves::serde::SerdeObject;
 use halo2curves::{CurveAffine, CurveExt, FieldExt};
 use rand_core::RngCore;
 use std::{
@@ -34,7 +37,7 @@ pub trait CommitmentScheme {
     type ParamsVerifier: for<'params> ParamsVerifier<'params, Self::Curve>;
 
     /// Wrapper for parameter generator
-    fn new_params(k: u32) -> Self::ParamsProver;
+    fn new_params<R: RngCore>(k: u32, rng: &mut R) -> Self::ParamsProver;
 
     /// Wrapper for parameter reader
     fn read_params<R: io::Read>(reader: &mut R) -> io::Result<Self::ParamsProver>;
@@ -80,7 +83,7 @@ pub trait ParamsProver<'params, C: CurveAffine>: Params<'params, C> {
     type ParamsVerifier: ParamsVerifier<'params, C>;
 
     /// Returns new instance of parameters
-    fn new(k: u32) -> Self;
+    fn new<R: RngCore>(k: u32, rng: &mut R) -> Self;
 
     /// This computes a commitment to a polynomial described by the provided
     /// slice of coefficients. The commitment may be blinded by the blinding
@@ -125,18 +128,22 @@ pub trait MSM<C: CurveAffine>: Clone + Debug + Send + Sync {
 }
 
 /// Common multi-open prover interface for various commitment schemes
-pub trait Prover<'params, Scheme: CommitmentScheme> {
+pub trait Prover<'params, E: MultiMillerLoop + Debug>
+where
+    E::G1Affine: SerdeObject,
+    E::G2Affine: SerdeObject,
+{
     /// Query instance or not
     const QUERY_INSTANCE: bool;
 
     /// Creates new prover instance
-    fn new(params: &'params Scheme::ParamsProver) -> Self;
+    fn new(params: &'params <KZGCommitmentScheme<E> as CommitmentScheme>::ParamsProver) -> Self;
 
     /// Create a multi-opening proof
     fn create_proof<
         'com,
-        E: EncodedChallenge<Scheme::Curve>,
-        T: TranscriptWrite<Scheme::Curve, E>,
+        EC: EncodedChallenge<E::G1Affine>,
+        T: TranscriptWrite<E::G1Affine, EC>,
         R,
         I,
     >(
@@ -146,15 +153,19 @@ pub trait Prover<'params, Scheme: CommitmentScheme> {
         queries: I,
     ) -> io::Result<()>
     where
-        I: IntoIterator<Item = ProverQuery<'com, Scheme::Curve>> + Clone,
+        I: IntoIterator<Item = ProverQuery<'com, E::G1Affine>> + Clone,
         R: RngCore;
 }
 
 /// Common multi-open verifier interface for various commitment schemes
-pub trait Verifier<'params, Scheme: CommitmentScheme> {
+pub trait Verifier<'params, E: MultiMillerLoop + Debug>
+where
+    E::G1Affine: SerdeObject,
+    E::G2Affine: SerdeObject,
+{
     /// Unfinalized verification result. This is returned in verification
     /// to allow developer to compress or combined verification results
-    type Guard: Guard<Scheme, MSMAccumulator = Self::MSMAccumulator>;
+    type Guard: Guard<KZGCommitmentScheme<E>, MSMAccumulator = Self::MSMAccumulator>;
 
     /// Accumulator fot comressed verification
     type MSMAccumulator;
@@ -163,13 +174,13 @@ pub trait Verifier<'params, Scheme: CommitmentScheme> {
     const QUERY_INSTANCE: bool;
 
     /// Creates new verifier instance
-    fn new(params: &'params Scheme::ParamsVerifier) -> Self;
+    fn new(params: &'params <KZGCommitmentScheme<E> as CommitmentScheme>::ParamsVerifier) -> Self;
 
     /// Process the proof and returns unfinished result named `Guard`
     fn verify_proof<
         'com,
-        E: EncodedChallenge<Scheme::Curve>,
-        T: TranscriptRead<Scheme::Curve, E>,
+        EC: EncodedChallenge<<KZGCommitmentScheme<E> as CommitmentScheme>::Curve>,
+        T: TranscriptRead<<KZGCommitmentScheme<E> as CommitmentScheme>::Curve, EC>,
         I,
     >(
         &self,
@@ -182,8 +193,11 @@ pub trait Verifier<'params, Scheme: CommitmentScheme> {
         I: IntoIterator<
                 Item = VerifierQuery<
                     'com,
-                    Scheme::Curve,
-                    <Scheme::ParamsVerifier as Params<'params, Scheme::Curve>>::MSM,
+                    <KZGCommitmentScheme<E> as CommitmentScheme>::Curve,
+                    <<KZGCommitmentScheme<E> as CommitmentScheme>::ParamsVerifier as Params<
+                        'params,
+                        <KZGCommitmentScheme<E> as CommitmentScheme>::Curve,
+                    >>::MSM,
                 >,
             > + Clone;
 }

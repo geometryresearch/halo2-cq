@@ -3,7 +3,10 @@ use std::marker::PhantomData;
 use halo2_proofs::{
     arithmetic::FieldExt,
     circuit::{AssignedCell, Chip, Layouter, Region, SimpleFloorPlanner, Value},
-    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance, Selector},
+    plonk::{
+        static_lookup::{StaticCommittedTable, StaticTable, StaticTableId, StaticTableValues},
+        Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance, Selector,
+    },
     poly::Rotation,
 };
 
@@ -230,6 +233,11 @@ impl<F: FieldExt> NumericInstructions<F> for FieldChip<F> {
         Ok(())
     }
 }
+// static simple_table: StaticTable<BN256> = StaticTable {
+//     opened,
+//     committed
+// };
+
 // ANCHOR_END: instructions-impl
 
 // ANCHOR: circuit
@@ -238,6 +246,7 @@ impl<F: FieldExt> NumericInstructions<F> for FieldChip<F> {
 /// In this struct we store the private input variables. We use `Option<F>` because
 /// they won't have any value during key generation. During proving, if any of these
 /// were `None` we would get an error.
+
 #[derive(Default)]
 struct MyCircuit<F: FieldExt> {
     constant: F,
@@ -264,6 +273,13 @@ impl<F: FieldExt> Circuit<F> for MyCircuit<F> {
         // Create a fixed column to load constants.
         let constant = meta.fixed_column();
 
+        meta.lookup_static("lookup_bits", |meta| {
+            (
+                meta.query_advice(vec![advice[0]], Rotation::cur()),
+                StaticTableId(String::from("bits_table")),
+            )
+        });
+
         FieldChip::configure(meta, advice, instance, constant)
     }
 
@@ -272,7 +288,10 @@ impl<F: FieldExt> Circuit<F> for MyCircuit<F> {
         config: Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
-        let field_chip = FieldChip::<F>::construct(config);
+        layouter
+            .register_static_table::<E>(StaticTableId(String::from("bits_table")), &simple_table)?;
+
+        let field_chip: FieldChip<F> = FieldChip::<F>::construct(config);
 
         // Load our private values into the circuit.
         let a = field_chip.load_private(layouter.namespace(|| "load a"), self.a)?;

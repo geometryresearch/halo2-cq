@@ -1,11 +1,13 @@
 use core::cmp::max;
 use core::ops::{Add, Mul};
 use ff::Field;
+use halo2curves::pairing::{Engine, MultiMillerLoop};
 use std::{
     convert::TryFrom,
     ops::{Neg, Sub},
 };
 
+use super::static_lookup::{self, StaticTable, StaticTableId};
 use super::{lookup, permutation, Assigned, Error};
 use crate::{
     circuit::{Layouter, Region, Value},
@@ -521,6 +523,7 @@ impl Challenge {
 /// This trait allows a [`Circuit`] to direct some backend to assign a witness
 /// for a constraint system.
 pub trait Assignment<F: Field> {
+    type E: MultiMillerLoop<Scalar = F>;
     /// Creates a new region and enters into it.
     ///
     /// Panics if we are currently in a region (if `exit_region` was not called).
@@ -541,6 +544,13 @@ pub trait Assignment<F: Field> {
     ///
     /// [`Layouter::assign_region`]: crate::circuit::Layouter#method.assign_region
     fn exit_region(&mut self);
+
+    /// Register a static table
+    fn register_static_table(
+        &mut self,
+        id: StaticTableId<String>,
+        static_table: StaticTable<Self::E>,
+    );
 
     /// Enables a selector at the given row.
     fn enable_selector<A, AR>(
@@ -625,6 +635,7 @@ pub trait Assignment<F: Field> {
 /// The floor planner is chip-agnostic and applies its strategy to the circuit it is used
 /// within.
 pub trait FloorPlanner {
+    type E: MultiMillerLoop;
     /// Given the provided `cs`, synthesize the given circuit.
     ///
     /// `constants` is the list of fixed columns that the layouter may use to assign
@@ -635,7 +646,7 @@ pub trait FloorPlanner {
     /// - Perform any necessary setup or measurement tasks, which may involve one or more
     ///   calls to `Circuit::default().synthesize(config, &mut layouter)`.
     /// - Call `circuit.synthesize(config, &mut layouter)` exactly once.
-    fn synthesize<F: Field, CS: Assignment<F>, C: Circuit<F>>(
+    fn synthesize<CS: Assignment<<Self::E as Engine>::Scalar, E = Self::E>, C: Circuit<Self::E>>(
         cs: &mut CS,
         circuit: &C,
         config: C::Config,
@@ -646,12 +657,12 @@ pub trait FloorPlanner {
 /// This is a trait that circuits provide implementations for so that the
 /// backend prover can ask the circuit to synthesize using some given
 /// [`ConstraintSystem`] implementation.
-pub trait Circuit<F: Field> {
+pub trait Circuit<E: MultiMillerLoop> {
     /// This is a configuration object that stores things like columns.
     type Config: Clone;
     /// The floor planner used for this circuit. This is an associated type of the
     /// `Circuit` trait because its behaviour is circuit-critical.
-    type FloorPlanner: FloorPlanner;
+    type FloorPlanner: FloorPlanner<E = E>;
 
     /// Returns a copy of this circuit with no witness values (i.e. all witnesses set to
     /// `None`). For most circuits, this will be equal to `Self::default()`.
@@ -659,12 +670,16 @@ pub trait Circuit<F: Field> {
 
     /// The circuit is given an opportunity to describe the exact gate
     /// arrangement, column arrangement, etc.
-    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config;
+    fn configure(meta: &mut ConstraintSystem<E::Scalar>) -> Self::Config;
 
     /// Given the provided `cs`, synthesize the circuit. The concrete type of
     /// the caller will be different depending on the context, and they may or
     /// may not expect to have a witness present.
-    fn synthesize(&self, config: Self::Config, layouter: impl Layouter<F>) -> Result<(), Error>;
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        layouter: impl Layouter<E::Scalar, E = E>,
+    ) -> Result<(), Error>;
 }
 
 /// Low-degree expression representing an identity that must hold over the committed columns.
@@ -1376,6 +1391,8 @@ pub struct ConstraintSystem<F: Field> {
     // input expressions and a sequence of table expressions involved in the lookup.
     pub(crate) lookups: Vec<lookup::Argument<F>>,
 
+    pub(crate) static_lookups: Vec<static_lookup::Argument<F>>,
+
     // Vector of fixed columns, which can be used to store constant values
     // that are copied into advice columns.
     pub(crate) constants: Vec<Column<Fixed>>,
@@ -1459,6 +1476,7 @@ impl<F: Field> Default for ConstraintSystem<F> {
             instance_queries: Vec::new(),
             permutation: permutation::Argument::new(),
             lookups: Vec::new(),
+            static_lookups: Vec::new(),
             constants: vec![],
             minimum_degree: None,
         }
@@ -1553,6 +1571,32 @@ impl<F: Field> ConstraintSystem<F> {
         let index = self.lookups.len();
 
         self.lookups.push(lookup::Argument::new(name, table_map));
+
+        index
+    }
+
+    /// cq lookup
+    pub fn lookup_static(
+        &mut self,
+        name: &'static str,
+        table_map: impl FnOnce(&mut VirtualCells<'_, F>) -> Vec<(Expression<F>, StaticTableId<String>)>,
+    ) -> usize {
+        let mut cells = VirtualCells::new(self);
+        let table_map = table_map(&mut cells)
+            .into_iter()
+            .map(|(input, table)| {
+                if input.contains_simple_selector() {
+                    panic!("expression containing simple selector supplied to lookup argument");
+                }
+
+                (input, table)
+            })
+            .collect();
+
+        let index = self.static_lookups.len();
+
+        self.static_lookups
+            .push(static_lookup::Argument::new(name, table_map));
 
         index
     }
@@ -1942,6 +1986,17 @@ impl<F: Field> ConstraintSystem<F> {
         degree = std::cmp::max(
             degree,
             self.lookups
+                .iter()
+                .map(|l| l.required_degree())
+                .max()
+                .unwrap_or(1),
+        );
+
+        // The static lookup argument also serves alongside the gates and must be accounted
+        // for.
+        degree = std::cmp::max(
+            degree,
+            self.static_lookups
                 .iter()
                 .map(|l| l.required_degree())
                 .max()

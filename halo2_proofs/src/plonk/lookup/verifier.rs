@@ -11,6 +11,9 @@ use crate::{
     transcript::{EncodedChallenge, TranscriptRead},
 };
 use ff::Field;
+use halo2curves::pairing::MultiMillerLoop;
+use halo2curves::serde::SerdeObject;
+use std::fmt::Debug;
 
 pub struct PermutationCommitments<C: CurveAffine> {
     permuted_input_commitment: C,
@@ -167,11 +170,16 @@ impl<C: CurveAffine> Evaluated<C> {
             ))
     }
 
-    pub(in crate::plonk) fn queries<'r, M: MSM<C> + 'r>(
+    pub(in crate::plonk) fn queries<'r, E: MultiMillerLoop, M: MSM<C> + 'r>(
         &'r self,
-        vk: &'r VerifyingKey<C>,
-        x: ChallengeX<C>,
-    ) -> impl Iterator<Item = VerifierQuery<'r, C, M>> + Clone {
+        vk: &'r VerifyingKey<E>,
+        x: ChallengeX<E::G1Affine>,
+    ) -> impl Iterator<Item = VerifierQuery<'r, E::G1Affine, M>> + Clone
+    where
+        E: MultiMillerLoop<G1Affine = C, Scalar = C::ScalarExt> + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         let x_inv = vk.domain.rotate_omega(*x, Rotation::prev());
         let x_next = vk.domain.rotate_omega(*x, Rotation::next());
 

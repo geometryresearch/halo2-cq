@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::iter;
+use std::marker::PhantomData;
 use std::ops::{Add, Mul, Neg, Range};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,12 +16,15 @@ use crate::{
     arithmetic::{FieldExt, Group},
     circuit,
     plonk::{
-        permutation, Advice, Any, Assigned, Assignment, Challenge, Circuit, Column, ColumnType,
+        permutation,
+        static_lookup::{StaticTable, StaticTableId},
+        Advice, Any, Assigned, Assignment, Challenge, Circuit, Column, ColumnType,
         ConstraintSystem, Error, Expression, Fixed, FloorPlanner, Instance, Phase, Selector,
         VirtualCell,
     },
     poly::Rotation,
 };
+use halo2curves::pairing::MultiMillerLoop;
 use rayon::{
     iter::{
         IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
@@ -287,7 +291,7 @@ impl<F: Group + Field> Mul<F> for Value<F> {
 /// ));
 /// ```
 #[derive(Debug)]
-pub struct MockProver<F: Group + Field> {
+pub struct MockProver<F: Group + Field, E: MultiMillerLoop<Scalar = F>> {
     k: u32,
     n: u32,
     cs: ConstraintSystem<F>,
@@ -313,9 +317,12 @@ pub struct MockProver<F: Group + Field> {
 
     // A range of available rows for assignment and copies.
     usable_rows: Range<usize>,
+    _marker: PhantomData<E>,
 }
 
-impl<F: Field + Group> Assignment<F> for MockProver<F> {
+impl<F: Field + Group, E: MultiMillerLoop<Scalar = F>> Assignment<F> for MockProver<F, E> {
+    type E = E;
+
     fn enter_region<NR, N>(&mut self, name: N)
     where
         NR: Into<String>,
@@ -333,6 +340,15 @@ impl<F: Field + Group> Assignment<F> for MockProver<F> {
 
     fn exit_region(&mut self) {
         self.regions.push(self.current_region.take().unwrap());
+    }
+
+    fn register_static_table(
+        &mut self,
+        id: StaticTableId<String>,
+        static_table: StaticTable<Self::E>,
+    ) {
+        // if ctx = prover then check that prover part is some and take it else panic
+        // if ctx = verifier then check that verifier part is some and take it else panic
     }
 
     fn enable_selector<A, AR>(&mut self, _: A, selector: &Selector, row: usize) -> Result<(), Error>
@@ -481,10 +497,10 @@ impl<F: Field + Group> Assignment<F> for MockProver<F> {
     }
 }
 
-impl<F: FieldExt> MockProver<F> {
+impl<F: FieldExt, E: MultiMillerLoop<Scalar = F> + std::marker::Sync> MockProver<F, E> {
     /// Runs a synthetic keygen-and-prove operation on the given circuit, collecting data
     /// about the constraints and their assignments.
-    pub fn run<ConcreteCircuit: Circuit<F>>(
+    pub fn run<ConcreteCircuit: Circuit<E>>(
         k: u32,
         circuit: &ConcreteCircuit,
         instance: Vec<Vec<F>>,
@@ -562,6 +578,7 @@ impl<F: FieldExt> MockProver<F> {
             challenges,
             permutation,
             usable_rows: 0..usable_rows,
+            _marker: PhantomData,
         };
 
         ConcreteCircuit::FloorPlanner::synthesize(&mut prover, circuit, config, constants)?;
@@ -1378,7 +1395,8 @@ impl<F: FieldExt> MockProver<F> {
 
 #[cfg(test)]
 mod tests {
-    use halo2curves::pasta::Fp;
+    // use halo2curves::pasta::Fp;
+    use halo2curves::bn256::{Bn256, Fr as Fp};
 
     use super::{FailureLocation, MockProver, VerifyFailure};
     use crate::{
@@ -1402,9 +1420,9 @@ mod tests {
 
         struct FaultyCircuit {}
 
-        impl Circuit<Fp> for FaultyCircuit {
+        impl Circuit<Bn256> for FaultyCircuit {
             type Config = FaultyCircuitConfig;
-            type FloorPlanner = SimpleFloorPlanner;
+            type FloorPlanner = SimpleFloorPlanner<Bn256>;
 
             fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
                 let a = meta.advice_column();
@@ -1480,9 +1498,9 @@ mod tests {
 
         struct FaultyCircuit {}
 
-        impl Circuit<Fp> for FaultyCircuit {
+        impl Circuit<Bn256> for FaultyCircuit {
             type Config = FaultyCircuitConfig;
-            type FloorPlanner = SimpleFloorPlanner;
+            type FloorPlanner = SimpleFloorPlanner<Bn256>;
 
             fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
                 let a = meta.advice_column();

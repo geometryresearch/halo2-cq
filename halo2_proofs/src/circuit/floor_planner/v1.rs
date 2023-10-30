@@ -189,6 +189,12 @@ impl<'p, 'a, F: Field, CS: Assignment<F> + 'a> Layouter<F> for V1Pass<'p, 'a, F,
         }
     }
 
+    fn register_static_table(&mut self, id: StaticTableId<String>, table: StaticTable<E>) {
+        if let Pass::Assignment(pass) = &mut self.0 {
+            pass.plan.cs.register_static_table(id, &table)
+        }
+    }
+
     fn constrain_instance(
         &mut self,
         cell: Cell,

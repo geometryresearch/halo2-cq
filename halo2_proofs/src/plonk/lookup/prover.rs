@@ -17,10 +17,13 @@ use group::{
     ff::{BatchInvert, Field},
     Curve,
 };
+use halo2curves::pairing::MultiMillerLoop;
+use halo2curves::serde::SerdeObject;
 use rand_core::RngCore;
 use std::{any::TypeId, convert::TryInto, num::ParseIntError, ops::Index};
 use std::{
     collections::BTreeMap,
+    fmt::Debug,
     iter,
     ops::{Mul, MulAssign},
 };
@@ -64,30 +67,33 @@ impl<F: FieldExt> Argument<F> {
     pub(in crate::plonk) fn commit_permuted<
         'a,
         'params: 'a,
-        C,
-        P: Params<'params, C>,
-        E: EncodedChallenge<C>,
+        E,
+        P: Params<'params, E::G1Affine>,
+        EC: EncodedChallenge<E::G1Affine>,
         R: RngCore,
-        T: TranscriptWrite<C, E>,
+        T: TranscriptWrite<E::G1Affine, EC>,
     >(
         &self,
-        pk: &ProvingKey<C>,
+        pk: &ProvingKey<E>,
         params: &P,
-        domain: &EvaluationDomain<C::Scalar>,
-        theta: ChallengeTheta<C>,
-        advice_values: &'a [Polynomial<C::Scalar, LagrangeCoeff>],
-        fixed_values: &'a [Polynomial<C::Scalar, LagrangeCoeff>],
-        instance_values: &'a [Polynomial<C::Scalar, LagrangeCoeff>],
-        challenges: &'a [C::Scalar],
+        domain: &EvaluationDomain<E::Scalar>,
+        theta: ChallengeTheta<E::G1Affine>,
+        advice_values: &'a [Polynomial<E::Scalar, LagrangeCoeff>],
+        fixed_values: &'a [Polynomial<E::Scalar, LagrangeCoeff>],
+        instance_values: &'a [Polynomial<E::Scalar, LagrangeCoeff>],
+        challenges: &'a [E::Scalar],
         mut rng: R,
         transcript: &mut T,
-    ) -> Result<Permuted<C>, Error>
+    ) -> Result<Permuted<E::G1Affine>, Error>
     where
-        C: CurveAffine<ScalarExt = F>,
-        C::Curve: Mul<F, Output = C::Curve> + MulAssign<F>,
+        E: MultiMillerLoop<Scalar = F> + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+        E::G1Affine: CurveAffine<ScalarExt = F>,
+        E::G1: Mul<E::Scalar, Output = E::G1> + MulAssign<E::Scalar>,
     {
         // Closure to get values of expressions and compress them
-        let compress_expressions = |expressions: &[Expression<C::Scalar>]| {
+        let compress_expressions = |expressions: &[Expression<E::Scalar>]| {
             let compressed_expression = expressions
                 .iter()
                 .map(|expression| {
@@ -124,9 +130,9 @@ impl<F: FieldExt> Argument<F> {
         )?;
 
         // Closure to construct commitment to vector of values
-        let mut commit_values = |values: &Polynomial<C::Scalar, LagrangeCoeff>| {
+        let mut commit_values = |values: &Polynomial<E::Scalar, LagrangeCoeff>| {
             let poly = pk.vk.domain.lagrange_to_coeff(values.clone());
-            let blind = Blind(C::Scalar::random(&mut rng));
+            let blind = Blind(E::Scalar::random(&mut rng));
             let commitment = params.commit_lagrange(values, blind).to_affine();
             (poly, blind, commitment)
         };
@@ -166,19 +172,25 @@ impl<C: CurveAffine> Permuted<C> {
     /// added to the Lookup and finally returned by the method.
     pub(in crate::plonk) fn commit_product<
         'params,
+        E,
         P: Params<'params, C>,
-        E: EncodedChallenge<C>,
+        EC: EncodedChallenge<C>,
         R: RngCore,
-        T: TranscriptWrite<C, E>,
+        T: TranscriptWrite<C, EC>,
     >(
         self,
-        pk: &ProvingKey<C>,
+        pk: &ProvingKey<E>,
         params: &P,
         beta: ChallengeBeta<C>,
         gamma: ChallengeGamma<C>,
         mut rng: R,
         transcript: &mut T,
-    ) -> Result<Committed<C>, Error> {
+    ) -> Result<Committed<C>, Error>
+    where
+        E: MultiMillerLoop<G1Affine = C, Scalar = C::ScalarExt> + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         let blinding_factors = pk.vk.cs.blinding_factors();
         // Goal is to compute the products of fractions
         //
@@ -306,12 +318,17 @@ impl<C: CurveAffine> Permuted<C> {
 }
 
 impl<C: CurveAffine> Committed<C> {
-    pub(in crate::plonk) fn evaluate<E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
+    pub(in crate::plonk) fn evaluate<E, EC: EncodedChallenge<C>, T: TranscriptWrite<C, EC>>(
         self,
-        pk: &ProvingKey<C>,
+        pk: &ProvingKey<E>,
         x: ChallengeX<C>,
         transcript: &mut T,
-    ) -> Result<Evaluated<C>, Error> {
+    ) -> Result<Evaluated<C>, Error>
+    where
+        E: MultiMillerLoop<G1Affine = C, Scalar = C::ScalarExt> + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         let domain = &pk.vk.domain;
         let x_inv = domain.rotate_omega(*x, Rotation::prev());
         let x_next = domain.rotate_omega(*x, Rotation::next());
@@ -338,11 +355,16 @@ impl<C: CurveAffine> Committed<C> {
 }
 
 impl<C: CurveAffine> Evaluated<C> {
-    pub(in crate::plonk) fn open<'a>(
+    pub(in crate::plonk) fn open<'a, E>(
         &'a self,
-        pk: &'a ProvingKey<C>,
+        pk: &'a ProvingKey<E>,
         x: ChallengeX<C>,
-    ) -> impl Iterator<Item = ProverQuery<'a, C>> + Clone {
+    ) -> impl Iterator<Item = ProverQuery<'a, C>> + Clone
+    where
+        E: MultiMillerLoop<G1Affine = C, Scalar = C::ScalarExt> + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         let x_inv = pk.vk.domain.rotate_omega(*x, Rotation::prev());
         let x_next = pk.vk.domain.rotate_omega(*x, Rotation::next());
 
@@ -388,32 +410,37 @@ type ExpressionPair<F> = (Polynomial<F, LagrangeCoeff>, Polynomial<F, LagrangeCo
 /// - the first row in a sequence of like values in A' is the row
 ///   that has the corresponding value in S'.
 /// This method returns (A', S') if no errors are encountered.
-fn permute_expression_pair<'params, C: CurveAffine, P: Params<'params, C>, R: RngCore>(
-    pk: &ProvingKey<C>,
+fn permute_expression_pair<'params, E, P: Params<'params, E::G1Affine>, R: RngCore>(
+    pk: &ProvingKey<E>,
     params: &P,
-    domain: &EvaluationDomain<C::Scalar>,
+    domain: &EvaluationDomain<E::Scalar>,
     mut rng: R,
-    input_expression: &Polynomial<C::Scalar, LagrangeCoeff>,
-    table_expression: &Polynomial<C::Scalar, LagrangeCoeff>,
-) -> Result<ExpressionPair<C::Scalar>, Error> {
+    input_expression: &Polynomial<E::Scalar, LagrangeCoeff>,
+    table_expression: &Polynomial<E::Scalar, LagrangeCoeff>,
+) -> Result<ExpressionPair<E::Scalar>, Error>
+where
+    E: MultiMillerLoop + Debug,
+    E::G1Affine: SerdeObject,
+    E::G2Affine: SerdeObject,
+{
     let blinding_factors = pk.vk.cs.blinding_factors();
     let usable_rows = params.n() as usize - (blinding_factors + 1);
 
-    let mut permuted_input_expression: Vec<C::Scalar> = input_expression.to_vec();
+    let mut permuted_input_expression: Vec<E::Scalar> = input_expression.to_vec();
     permuted_input_expression.truncate(usable_rows);
 
     // Sort input lookup expression values
     permuted_input_expression.sort();
 
     // A BTreeMap of each unique element in the table expression and its count
-    let mut leftover_table_map: BTreeMap<C::Scalar, u32> = table_expression
+    let mut leftover_table_map: BTreeMap<E::Scalar, u32> = table_expression
         .iter()
         .take(usable_rows)
         .fold(BTreeMap::new(), |mut acc, coeff| {
             *acc.entry(*coeff).or_insert(0) += 1;
             acc
         });
-    let mut permuted_table_coeffs = vec![C::Scalar::zero(); usable_rows];
+    let mut permuted_table_coeffs = vec![E::Scalar::zero(); usable_rows];
 
     let mut repeated_input_rows = permuted_input_expression
         .iter()
@@ -448,8 +475,8 @@ fn permute_expression_pair<'params, C: CurveAffine, P: Params<'params, C>, R: Rn
     assert!(repeated_input_rows.is_empty());
 
     permuted_input_expression
-        .extend((0..(blinding_factors + 1)).map(|_| C::Scalar::random(&mut rng)));
-    permuted_table_coeffs.extend((0..(blinding_factors + 1)).map(|_| C::Scalar::random(&mut rng)));
+        .extend((0..(blinding_factors + 1)).map(|_| E::Scalar::random(&mut rng)));
+    permuted_table_coeffs.extend((0..(blinding_factors + 1)).map(|_| E::Scalar::random(&mut rng)));
     assert_eq!(permuted_input_expression.len(), params.n() as usize);
     assert_eq!(permuted_table_coeffs.len(), params.n() as usize);
 

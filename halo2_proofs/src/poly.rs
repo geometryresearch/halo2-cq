@@ -21,8 +21,8 @@ mod domain;
 mod query;
 mod strategy;
 
-/// Inner product argument commitment scheme
-pub mod ipa;
+// /// Inner product argument commitment scheme
+// pub mod ipa;
 
 /// KZG commitment scheme
 pub mod kzg;
@@ -67,7 +67,7 @@ impl Basis for ExtendedLagrangeCoeff {}
 /// basis.
 #[derive(Clone, Debug)]
 pub struct Polynomial<F, B> {
-    values: Vec<F>,
+    pub(crate) values: Vec<F>,
     _marker: PhantomData<B>,
 }
 

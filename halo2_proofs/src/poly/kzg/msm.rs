@@ -167,4 +167,16 @@ impl<'a, E: MultiMillerLoop + Debug> DualMSM<'a, E> {
                 .is_identity(),
         )
     }
+
+    // reuturn pair to check
+    pub fn into_pair(self) -> [(E::G1Affine, E::G2Affine); 2] {
+        let left = self.left.eval();
+        let right = -self.right.eval();
+
+        let (term_1, term_2) = (
+            (left.into(), self.params.s_g2),
+            (right.into(), self.params.g2),
+        );
+        [term_1, term_2]
+    }
 }

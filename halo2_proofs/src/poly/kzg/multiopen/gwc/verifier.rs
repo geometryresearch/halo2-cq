@@ -30,7 +30,7 @@ pub struct VerifierGWC<'params, E: Engine> {
     params: &'params ParamsKZG<E>,
 }
 
-impl<'params, E> Verifier<'params, KZGCommitmentScheme<E>> for VerifierGWC<'params, E>
+impl<'params, E> Verifier<'params, E> for VerifierGWC<'params, E>
 where
     E: MultiMillerLoop + Debug,
     E::G1Affine: SerdeCurveAffine,

@@ -3,10 +3,12 @@
 use std::{convert::TryInto, fmt, marker::PhantomData};
 
 use ff::Field;
+use halo2curves::pairing::MultiMillerLoop;
 
 use crate::{
     arithmetic::FieldExt,
     plonk::{
+        static_lookup::{StaticTable, StaticTableId},
         Advice, Any, Assigned, Challenge, Column, Error, Fixed, Instance, Selector, TableColumn,
     },
 };
@@ -407,7 +409,8 @@ impl<'r, F: Field> Table<'r, F> {
 pub trait Layouter<F: Field> {
     /// Represents the type of the "root" of this layouter, so that nested namespaces
     /// can minimize indirection.
-    type Root: Layouter<F>;
+    type Root: Layouter<F, E = Self::E>;
+    type E: MultiMillerLoop<Scalar = F>;
 
     /// Assign a region of gates to an absolute row number.
     ///
@@ -441,6 +444,9 @@ pub trait Layouter<F: Field> {
         N: Fn() -> NR,
         NR: Into<String>;
 
+    /// Register static table
+    fn register_static_table(&mut self, id: StaticTableId<String>, table: StaticTable<Self::E>);
+
     /// Constrains a [`Cell`] to equal an instance column's row value at an
     /// absolute position.
     fn constrain_instance(&mut self, cell: Cell, column: Column<Instance>, row: usize);
@@ -469,7 +475,7 @@ pub trait Layouter<F: Field> {
     fn pop_namespace(&mut self, gadget_name: Option<String>);
 
     /// Enters into a namespace.
-    fn namespace<NR, N>(&mut self, name_fn: N) -> NamespacedLayouter<'_, F, Self::Root>
+    fn namespace<NR, N>(&mut self, name_fn: N) -> NamespacedLayouter<'_, Self::E, F, Self::Root>
     where
         NR: Into<String>,
         N: FnOnce() -> NR,
@@ -483,10 +489,18 @@ pub trait Layouter<F: Field> {
 /// This is a "namespaced" layouter which borrows a `Layouter` (pushing a namespace
 /// context) and, when dropped, pops out of the namespace context.
 #[derive(Debug)]
-pub struct NamespacedLayouter<'a, F: Field, L: Layouter<F> + 'a>(&'a mut L, PhantomData<F>);
+pub struct NamespacedLayouter<
+    'a,
+    E: MultiMillerLoop<Scalar = F>,
+    F: Field,
+    L: Layouter<F, E = E> + 'a,
+>(&'a mut L, PhantomData<(E, F)>);
 
-impl<'a, F: Field, L: Layouter<F> + 'a> Layouter<F> for NamespacedLayouter<'a, F, L> {
+impl<'a, E: MultiMillerLoop<Scalar = F>, F: Field, L: Layouter<F, E = E> + 'a> Layouter<F>
+    for NamespacedLayouter<'a, E, F, L>
+{
     type Root = L::Root;
+    type E = E;
 
     fn assign_region<A, AR, N, NR>(&mut self, name: N, assignment: A) -> Result<AR, Error>
     where
@@ -504,6 +518,10 @@ impl<'a, F: Field, L: Layouter<F> + 'a> Layouter<F> for NamespacedLayouter<'a, F
         NR: Into<String>,
     {
         self.0.assign_table(name, assignment)
+    }
+
+    fn register_static_table(&mut self, id: StaticTableId<String>, table: StaticTable<E>) {
+        self.0.register_static_table(id, table);
     }
 
     fn constrain_instance(&mut self, cell: Cell, column: Column<Instance>, row: usize) {
@@ -531,7 +549,9 @@ impl<'a, F: Field, L: Layouter<F> + 'a> Layouter<F> for NamespacedLayouter<'a, F
     }
 }
 
-impl<'a, F: Field, L: Layouter<F> + 'a> Drop for NamespacedLayouter<'a, F, L> {
+impl<'a, E: MultiMillerLoop<Scalar = F>, F: Field, L: Layouter<F, E = E> + 'a> Drop
+    for NamespacedLayouter<'a, E, F, L>
+{
     fn drop(&mut self) {
         let gadget_name = {
             #[cfg(feature = "gadget-traces")]

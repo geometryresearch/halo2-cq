@@ -2,6 +2,7 @@ use group::{
     ff::{BatchInvert, Field},
     Curve,
 };
+use halo2curves::{pairing::MultiMillerLoop, serde::SerdeObject};
 use rand_core::RngCore;
 use std::iter::{self, ExactSizeIterator};
 
@@ -17,6 +18,7 @@ use crate::{
     },
     transcript::{EncodedChallenge, TranscriptWrite},
 };
+use std::fmt::Debug;
 
 pub(crate) struct CommittedSet<C: CurveAffine> {
     pub(crate) permutation_product_poly: Polynomial<C::Scalar, Coeff>,
@@ -44,24 +46,29 @@ pub(crate) struct Evaluated<C: CurveAffine> {
 impl Argument {
     pub(in crate::plonk) fn commit<
         'params,
-        C: CurveAffine,
-        P: Params<'params, C>,
-        E: EncodedChallenge<C>,
+        E,
+        P: Params<'params, E::G1Affine>,
+        EC: EncodedChallenge<E::G1Affine>,
         R: RngCore,
-        T: TranscriptWrite<C, E>,
+        T: TranscriptWrite<E::G1Affine, EC>,
     >(
         &self,
         params: &P,
-        pk: &plonk::ProvingKey<C>,
-        pkey: &ProvingKey<C>,
-        advice: &[Polynomial<C::Scalar, LagrangeCoeff>],
-        fixed: &[Polynomial<C::Scalar, LagrangeCoeff>],
-        instance: &[Polynomial<C::Scalar, LagrangeCoeff>],
-        beta: ChallengeBeta<C>,
-        gamma: ChallengeGamma<C>,
+        pk: &plonk::ProvingKey<E>,
+        pkey: &ProvingKey<E::G1Affine>,
+        advice: &[Polynomial<E::Scalar, LagrangeCoeff>],
+        fixed: &[Polynomial<E::Scalar, LagrangeCoeff>],
+        instance: &[Polynomial<E::Scalar, LagrangeCoeff>],
+        beta: ChallengeBeta<E::G1Affine>,
+        gamma: ChallengeGamma<E::G1Affine>,
         mut rng: R,
         transcript: &mut T,
-    ) -> Result<Committed<C>, Error> {
+    ) -> Result<Committed<E::G1Affine>, Error>
+    where
+        E: MultiMillerLoop + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         let domain = &pk.vk.domain;
 
         // How many columns can be included in a single permutation polynomial?
@@ -73,10 +80,10 @@ impl Argument {
         let blinding_factors = pk.vk.cs.blinding_factors();
 
         // Each column gets its own delta power.
-        let mut deltaomega = C::Scalar::one();
+        let mut deltaomega = E::Scalar::one();
 
         // Track the "last" value from the previous column set
-        let mut last_z = C::Scalar::one();
+        let mut last_z = E::Scalar::one();
 
         let mut sets = vec![];
 
@@ -93,7 +100,7 @@ impl Argument {
             // where p_j(X) is the jth column in this permutation,
             // and i is the ith row of the column.
 
-            let mut modified_values = vec![C::Scalar::one(); params.n() as usize];
+            let mut modified_values = vec![E::Scalar::one(); params.n() as usize];
 
             // Iterate over each column of the permutation
             for (&column, permuted_column_values) in columns.iter().zip(permutations.iter()) {
@@ -136,7 +143,7 @@ impl Argument {
                         deltaomega *= &omega;
                     }
                 });
-                deltaomega *= &C::Scalar::DELTA;
+                deltaomega *= &E::Scalar::DELTA;
             }
 
             // The modified_values vector is a vector of products of fractions
@@ -160,12 +167,12 @@ impl Argument {
             let mut z = domain.lagrange_from_vec(z);
             // Set blinding factors
             for z in &mut z[params.n() as usize - blinding_factors..] {
-                *z = C::Scalar::random(&mut rng);
+                *z = E::Scalar::random(&mut rng);
             }
             // Set new last_z
             last_z = z[params.n() as usize - (blinding_factors + 1)];
 
-            let blind = Blind(C::Scalar::random(&mut rng));
+            let blind = Blind(E::Scalar::random(&mut rng));
 
             let permutation_product_commitment_projective = params.commit_lagrange(&z, blind);
             let permutation_product_blind = blind;
@@ -233,12 +240,17 @@ impl<C: CurveAffine> super::ProvingKey<C> {
 }
 
 impl<C: CurveAffine> Constructed<C> {
-    pub(in crate::plonk) fn evaluate<E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
+    pub(in crate::plonk) fn evaluate<E, EC: EncodedChallenge<C>, T: TranscriptWrite<C, EC>>(
         self,
-        pk: &plonk::ProvingKey<C>,
+        pk: &plonk::ProvingKey<E>,
         x: ChallengeX<C>,
         transcript: &mut T,
-    ) -> Result<Evaluated<C>, Error> {
+    ) -> Result<Evaluated<C>, Error>
+    where
+        E: MultiMillerLoop<G1Affine = C, Scalar = C::ScalarExt> + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         let domain = &pk.vk.domain;
         let blinding_factors = pk.vk.cs.blinding_factors();
 
@@ -280,11 +292,16 @@ impl<C: CurveAffine> Constructed<C> {
 }
 
 impl<C: CurveAffine> Evaluated<C> {
-    pub(in crate::plonk) fn open<'a>(
+    pub(in crate::plonk) fn open<'a, E>(
         &'a self,
-        pk: &'a plonk::ProvingKey<C>,
+        pk: &'a plonk::ProvingKey<E>,
         x: ChallengeX<C>,
-    ) -> impl Iterator<Item = ProverQuery<'a, C>> + Clone {
+    ) -> impl Iterator<Item = ProverQuery<'a, C>> + Clone
+    where
+        E: MultiMillerLoop<Scalar = C::Scalar> + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         let blinding_factors = pk.vk.cs.blinding_factors();
         let x_next = pk.vk.domain.rotate_omega(*x, Rotation::next());
         let x_last = pk

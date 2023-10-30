@@ -7,7 +7,10 @@
 
 use blake2b_simd::Params as Blake2bParams;
 use ff::PrimeField;
-use group::ff::Field;
+use group::{ff::Field, GroupEncoding};
+use halo2curves::pairing::{Engine, MultiMillerLoop};
+use halo2curves::serde::SerdeObject;
+use halo2curves::CurveExt;
 
 use crate::arithmetic::{CurveAffine, FieldExt};
 use crate::helpers::{
@@ -28,6 +31,7 @@ mod evaluation;
 mod keygen;
 mod lookup;
 pub(crate) mod permutation;
+pub mod static_lookup;
 mod vanishing;
 
 mod prover;
@@ -41,26 +45,41 @@ pub use prover::*;
 pub use verifier::*;
 
 use evaluation::Evaluator;
+use std::collections::BTreeMap;
+use std::fmt::Debug;
 use std::io;
+
+use self::static_lookup::{
+    StaticCommittedTable, StaticTable, StaticTableConfig, StaticTableId, StaticTableValues,
+};
 
 /// This is a verifying key which allows for the verification of proofs for a
 /// particular circuit.
 #[derive(Clone, Debug)]
-pub struct VerifyingKey<C: CurveAffine> {
-    domain: EvaluationDomain<C::Scalar>,
-    fixed_commitments: Vec<C>,
-    permutation: permutation::VerifyingKey<C>,
-    cs: ConstraintSystem<C::Scalar>,
+pub struct VerifyingKey<E>
+where
+    E: MultiMillerLoop + Debug,
+    E::G1Affine: SerdeCurveAffine,
+    E::G2Affine: SerdeCurveAffine,
+{
+    domain: EvaluationDomain<E::Scalar>,
+    fixed_commitments: Vec<E::G1Affine>,
+    permutation: permutation::VerifyingKey<E::G1Affine>,
+    cs: ConstraintSystem<E::Scalar>,
     /// Cached maximum degree of `cs` (which doesn't change after construction).
     cs_degree: usize,
     /// The representative of this `VerifyingKey` in transcripts.
-    transcript_repr: C::Scalar,
+    transcript_repr: E::Scalar,
     selectors: Vec<Vec<bool>>,
+    static_table_mapping: BTreeMap<StaticTableId<String>, StaticCommittedTable<E>>,
 }
 
-impl<C: SerdeCurveAffine> VerifyingKey<C>
+impl<E> VerifyingKey<E>
 where
-    C::Scalar: SerdePrimeField,
+    E: MultiMillerLoop + Debug,
+    E::G1Affine: SerdeCurveAffine,
+    E::G2Affine: SerdeCurveAffine,
+    E::Scalar: SerdePrimeField,
 {
     /// Writes a verifying key to a buffer.
     ///
@@ -101,20 +120,20 @@ where
     /// Checks that field elements are less than modulus, and then checks that the point is on the curve.
     /// - `RawBytesUnchecked`: Reads an uncompressed curve element with coordinates in Montgomery form;
     /// does not perform any checks
-    pub fn read<R: io::Read, ConcreteCircuit: Circuit<C::Scalar>>(
+    pub fn read<R: io::Read, ConcreteCircuit: Circuit<E>>(
         reader: &mut R,
         format: SerdeFormat,
     ) -> io::Result<Self> {
         let mut k = [0u8; 4];
         reader.read_exact(&mut k)?;
         let k = u32::from_be_bytes(k);
-        let (domain, cs, _) = keygen::create_domain::<C, ConcreteCircuit>(k);
+        let (domain, cs, _) = keygen::create_domain::<E, ConcreteCircuit>(k);
         let mut num_fixed_columns = [0u8; 4];
         reader.read_exact(&mut num_fixed_columns).unwrap();
         let num_fixed_columns = u32::from_be_bytes(num_fixed_columns);
 
         let fixed_commitments: Vec<_> = (0..num_fixed_columns)
-            .map(|_| C::read(reader, format))
+            .map(|_| E::G1Affine::read(reader, format))
             .collect();
 
         let permutation = permutation::VerifyingKey::read(reader, &cs.permutation, format);
@@ -139,6 +158,8 @@ where
             permutation,
             cs,
             selectors,
+            // TODO: FIXME
+            BTreeMap::default(),
         ))
     }
 
@@ -150,7 +171,7 @@ where
     }
 
     /// Reads a verification key from a slice of bytes using [`Self::read`].
-    pub fn from_bytes<ConcreteCircuit: Circuit<C::Scalar>>(
+    pub fn from_bytes<ConcreteCircuit: Circuit<E>>(
         mut bytes: &[u8],
         format: SerdeFormat,
     ) -> io::Result<Self> {
@@ -158,9 +179,13 @@ where
     }
 }
 
-impl<C: CurveAffine> VerifyingKey<C> {
+impl<E: MultiMillerLoop + Debug> VerifyingKey<E>
+where
+    E::G1Affine: SerdeCurveAffine,
+    E::G2Affine: SerdeCurveAffine,
+{
     fn bytes_length(&self) -> usize {
-        8 + (self.fixed_commitments.len() * C::default().to_bytes().as_ref().len())
+        8 + (self.fixed_commitments.len() * E::G1Affine::default().to_bytes().as_ref().len())
             + self.permutation.bytes_length()
             + self.selectors.len()
                 * (self
@@ -171,11 +196,12 @@ impl<C: CurveAffine> VerifyingKey<C> {
     }
 
     fn from_parts(
-        domain: EvaluationDomain<C::Scalar>,
-        fixed_commitments: Vec<C>,
-        permutation: permutation::VerifyingKey<C>,
-        cs: ConstraintSystem<C::Scalar>,
+        domain: EvaluationDomain<E::Scalar>,
+        fixed_commitments: Vec<E::G1Affine>,
+        permutation: permutation::VerifyingKey<E::G1Affine>,
+        cs: ConstraintSystem<E::Scalar>,
         selectors: Vec<Vec<bool>>,
+        static_table_mapping: BTreeMap<StaticTableId<String>, StaticCommittedTable<E>>,
     ) -> Self {
         // Compute cached values.
         let cs_degree = cs.degree();
@@ -187,8 +213,9 @@ impl<C: CurveAffine> VerifyingKey<C> {
             cs,
             cs_degree,
             // Temporary, this is not pinned.
-            transcript_repr: C::Scalar::zero(),
+            transcript_repr: E::Scalar::zero(),
             selectors,
+            static_table_mapping,
         };
 
         let mut hasher = Blake2bParams::new()
@@ -202,13 +229,13 @@ impl<C: CurveAffine> VerifyingKey<C> {
         hasher.update(s.as_bytes());
 
         // Hash in final Blake2bState
-        vk.transcript_repr = C::Scalar::from_bytes_wide(hasher.finalize().as_array());
+        vk.transcript_repr = E::Scalar::from_bytes_wide(hasher.finalize().as_array());
 
         vk
     }
 
     /// Hashes a verification key into a transcript.
-    pub fn hash_into<E: EncodedChallenge<C>, T: Transcript<C, E>>(
+    pub fn hash_into<EC: EncodedChallenge<E::G1Affine>, T: Transcript<E::G1Affine, EC>>(
         &self,
         transcript: &mut T,
     ) -> io::Result<()> {
@@ -219,10 +246,10 @@ impl<C: CurveAffine> VerifyingKey<C> {
 
     /// Obtains a pinned representation of this verification key that contains
     /// the minimal information necessary to reconstruct the verification key.
-    pub fn pinned(&self) -> PinnedVerificationKey<'_, C> {
+    pub fn pinned(&self) -> PinnedVerificationKey<'_, E::G1Affine> {
         PinnedVerificationKey {
-            base_modulus: C::Base::MODULUS,
-            scalar_modulus: C::Scalar::MODULUS,
+            base_modulus: <E::G1Affine as CurveAffine>::Base::MODULUS,
+            scalar_modulus: <E::Scalar as FieldExt>::MODULUS,
             domain: self.domain.pinned(),
             fixed_commitments: &self.fixed_commitments,
             permutation: &self.permutation,
@@ -231,17 +258,17 @@ impl<C: CurveAffine> VerifyingKey<C> {
     }
 
     /// Returns commitments of fixed polynomials
-    pub fn fixed_commitments(&self) -> &Vec<C> {
+    pub fn fixed_commitments(&self) -> &Vec<E::G1Affine> {
         &self.fixed_commitments
     }
 
     /// Returns `VerifyingKey` of permutation
-    pub fn permutation(&self) -> &permutation::VerifyingKey<C> {
+    pub fn permutation(&self) -> &permutation::VerifyingKey<E::G1Affine> {
         &self.permutation
     }
 
     /// Returns `ConstraintSystem`
-    pub fn cs(&self) -> &ConstraintSystem<C::Scalar> {
+    pub fn cs(&self) -> &ConstraintSystem<E::Scalar> {
         &self.cs
     }
 }
@@ -261,27 +288,38 @@ pub struct PinnedVerificationKey<'a, C: CurveAffine> {
 /// This is a proving key which allows for the creation of proofs for a
 /// particular circuit.
 #[derive(Clone, Debug)]
-pub struct ProvingKey<C: CurveAffine> {
-    vk: VerifyingKey<C>,
-    l0: Polynomial<C::Scalar, ExtendedLagrangeCoeff>,
-    l_last: Polynomial<C::Scalar, ExtendedLagrangeCoeff>,
-    l_active_row: Polynomial<C::Scalar, ExtendedLagrangeCoeff>,
-    fixed_values: Vec<Polynomial<C::Scalar, LagrangeCoeff>>,
-    fixed_polys: Vec<Polynomial<C::Scalar, Coeff>>,
-    fixed_cosets: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>>,
-    permutation: permutation::ProvingKey<C>,
-    ev: Evaluator<C>,
+pub struct ProvingKey<E: MultiMillerLoop + Debug>
+where
+    E::G1Affine: SerdeObject,
+    E::G2Affine: SerdeObject,
+{
+    vk: VerifyingKey<E>,
+    l0: Polynomial<E::Scalar, ExtendedLagrangeCoeff>,
+    l_last: Polynomial<E::Scalar, ExtendedLagrangeCoeff>,
+    l_active_row: Polynomial<E::Scalar, ExtendedLagrangeCoeff>,
+    fixed_values: Vec<Polynomial<E::Scalar, LagrangeCoeff>>,
+    fixed_polys: Vec<Polynomial<E::Scalar, Coeff>>,
+    fixed_cosets: Vec<Polynomial<E::Scalar, ExtendedLagrangeCoeff>>,
+    permutation: permutation::ProvingKey<E::G1Affine>,
+    ev: Evaluator<E::G1Affine>,
+    static_table_mapping: BTreeMap<StaticTableId<String>, StaticTableValues<E>>,
+    static_table_configs: BTreeMap<usize, StaticTableConfig<E>>,
+    b0_g1_bound: Vec<E::G1Affine>,
 }
 
-impl<C: CurveAffine> ProvingKey<C> {
+impl<E: MultiMillerLoop + Debug> ProvingKey<E>
+where
+    E::G1Affine: SerdeObject,
+    E::G2Affine: SerdeObject,
+{
     /// Get the underlying [`VerifyingKey`].
-    pub fn get_vk(&self) -> &VerifyingKey<C> {
+    pub fn get_vk(&self) -> &VerifyingKey<E> {
         &self.vk
     }
 
     /// Gets the total number of bytes in the serialization of `self`
     fn bytes_length(&self) -> usize {
-        let scalar_len = C::Scalar::default().to_repr().as_ref().len();
+        let scalar_len = E::Scalar::default().to_repr().as_ref().len();
         self.vk.bytes_length()
             + 12
             + scalar_len * (self.l0.len() + self.l_last.len() + self.l_active_row.len())
@@ -292,9 +330,11 @@ impl<C: CurveAffine> ProvingKey<C> {
     }
 }
 
-impl<C: SerdeCurveAffine> ProvingKey<C>
+impl<E: MultiMillerLoop + Debug> ProvingKey<E>
 where
-    C::Scalar: SerdePrimeField,
+    E::Scalar: SerdePrimeField,
+    E::G1Affine: SerdeObject,
+    E::G2Affine: SerdeObject,
 {
     /// Writes a proving key to a buffer.
     ///
@@ -329,11 +369,11 @@ where
     /// Checks that field elements are less than modulus, and then checks that the point is on the curve.
     /// - `RawBytesUnchecked`: Reads an uncompressed curve element with coordinates in Montgomery form;
     /// does not perform any checks
-    pub fn read<R: io::Read, ConcreteCircuit: Circuit<C::Scalar>>(
+    pub fn read<R: io::Read, ConcreteCircuit: Circuit<E>>(
         reader: &mut R,
         format: SerdeFormat,
     ) -> io::Result<Self> {
-        let vk = VerifyingKey::<C>::read::<R, ConcreteCircuit>(reader, format).unwrap();
+        let vk = VerifyingKey::<E>::read::<R, ConcreteCircuit>(reader, format).unwrap();
         let l0 = Polynomial::read(reader, format);
         let l_last = Polynomial::read(reader, format);
         let l_active_row = Polynomial::read(reader, format);
@@ -341,7 +381,10 @@ where
         let fixed_polys = read_polynomial_vec(reader, format);
         let fixed_cosets = read_polynomial_vec(reader, format);
         let permutation = permutation::ProvingKey::read(reader, format);
+        // TODO:
+        // let static_tables = static_lookup::StaticTable::read(reader, format);
         let ev = Evaluator::new(vk.cs());
+
         Ok(Self {
             vk,
             l0,
@@ -352,6 +395,10 @@ where
             fixed_cosets,
             permutation,
             ev,
+            // FIXME
+            static_table_mapping: BTreeMap::default(),
+            static_table_configs: BTreeMap::default(),
+            b0_g1_bound: vec![],
         })
     }
 
@@ -363,7 +410,7 @@ where
     }
 
     /// Reads a proving key from a slice of bytes using [`Self::read`].
-    pub fn from_bytes<ConcreteCircuit: Circuit<C::Scalar>>(
+    pub fn from_bytes<ConcreteCircuit: Circuit<E>>(
         mut bytes: &[u8],
         format: SerdeFormat,
     ) -> io::Result<Self> {
@@ -371,9 +418,13 @@ where
     }
 }
 
-impl<C: CurveAffine> VerifyingKey<C> {
+impl<E: MultiMillerLoop + Debug> VerifyingKey<E>
+where
+    E::G1Affine: SerdeObject,
+    E::G2Affine: SerdeObject,
+{
     /// Get the underlying [`EvaluationDomain`].
-    pub fn get_domain(&self) -> &EvaluationDomain<C::Scalar> {
+    pub fn get_domain(&self) -> &EvaluationDomain<E::Scalar> {
         &self.domain
     }
 }

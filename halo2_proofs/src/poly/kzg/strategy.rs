@@ -10,7 +10,7 @@ use crate::{
     plonk::Error,
     poly::{
         commitment::{Verifier, MSM},
-        ipa::msm::MSMIPA,
+        // ipa::msm::MSMIPA,
         strategy::{Guard, VerificationStrategy},
     },
     transcript::{EncodedChallenge, TranscriptRead},
@@ -18,6 +18,7 @@ use crate::{
 use ff::Field;
 use group::Group;
 use halo2curves::{
+    batch_pairing::PairingBatcher,
     pairing::{Engine, MillerLoopResult, MultiMillerLoop},
     CurveAffine,
 };
@@ -84,13 +85,8 @@ impl<'params, E: MultiMillerLoop + Debug> SingleStrategy<'params, E> {
 impl<
         'params,
         E: MultiMillerLoop + Debug,
-        V: Verifier<
-            'params,
-            KZGCommitmentScheme<E>,
-            MSMAccumulator = DualMSM<'params, E>,
-            Guard = GuardKZG<'params, E>,
-        >,
-    > VerificationStrategy<'params, KZGCommitmentScheme<E>, V> for AccumulatorStrategy<'params, E>
+        V: Verifier<'params, E, MSMAccumulator = DualMSM<'params, E>, Guard = GuardKZG<'params, E>>,
+    > VerificationStrategy<'params, E, V> for AccumulatorStrategy<'params, E>
 where
     E::G1Affine: SerdeCurveAffine,
     E::G2Affine: SerdeCurveAffine,
@@ -117,18 +113,18 @@ where
     fn finalize(self) -> bool {
         self.msm_accumulator.check()
     }
+
+    fn merge_with_pairing_batcher(self, pairing_batcher: &mut PairingBatcher<E>) {
+        let pair = self.msm_accumulator.into_pair();
+        pairing_batcher.add_pairing(&pair);
+    }
 }
 
 impl<
         'params,
         E: MultiMillerLoop + Debug,
-        V: Verifier<
-            'params,
-            KZGCommitmentScheme<E>,
-            MSMAccumulator = DualMSM<'params, E>,
-            Guard = GuardKZG<'params, E>,
-        >,
-    > VerificationStrategy<'params, KZGCommitmentScheme<E>, V> for SingleStrategy<'params, E>
+        V: Verifier<'params, E, MSMAccumulator = DualMSM<'params, E>, Guard = GuardKZG<'params, E>>,
+    > VerificationStrategy<'params, E, V> for SingleStrategy<'params, E>
 where
     E::G1Affine: SerdeCurveAffine,
     E::G2Affine: SerdeCurveAffine,
@@ -154,6 +150,10 @@ where
     }
 
     fn finalize(self) -> bool {
+        unreachable!();
+    }
+
+    fn merge_with_pairing_batcher(self, _pairing_batcher: &mut PairingBatcher<E>) {
         unreachable!();
     }
 }

@@ -3,8 +3,10 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use ff::Field;
+use halo2curves::pairing::MultiMillerLoop;
 use rustc_hash::FxHashMap;
 
+use crate::plonk::static_lookup::{StaticTable, StaticTableId};
 use crate::{
     circuit::{
         layouter::{RegionColumn, RegionLayouter, RegionShape, TableLayouter},
@@ -22,22 +24,28 @@ use crate::{
 /// "business logic" in the circuit layout as closely as possible. It uses a single-pass
 /// layouter that does not reorder regions for optimal packing.
 #[derive(Debug)]
-pub struct SimpleFloorPlanner;
+pub struct SimpleFloorPlanner<E: MultiMillerLoop>(PhantomData<E>);
 
-impl FloorPlanner for SimpleFloorPlanner {
-    fn synthesize<F: Field, CS: Assignment<F>, C: Circuit<F>>(
+impl<E: MultiMillerLoop> FloorPlanner for SimpleFloorPlanner<E> {
+    type E = E;
+    fn synthesize<CS: Assignment<E::Scalar, E = E>, C: Circuit<E>>(
         cs: &mut CS,
         circuit: &C,
         config: C::Config,
         constants: Vec<Column<Fixed>>,
     ) -> Result<(), Error> {
-        let layouter = SingleChipLayouter::new(cs, constants)?;
+        let layouter = SingleChipLayouter::<E, E::Scalar, CS>::new(cs, constants)?;
         circuit.synthesize(config, layouter)
     }
 }
 
 /// A [`Layouter`] for a single-chip circuit.
-pub struct SingleChipLayouter<'a, F: Field, CS: Assignment<F> + 'a> {
+pub struct SingleChipLayouter<
+    'a,
+    E: MultiMillerLoop<Scalar = F>,
+    F: Field,
+    CS: Assignment<F, E = E> + 'a,
+> {
     cs: &'a mut CS,
     constants: Vec<Column<Fixed>>,
     // Stores the starting row for each region.
@@ -47,10 +55,14 @@ pub struct SingleChipLayouter<'a, F: Field, CS: Assignment<F> + 'a> {
     columns: FxHashMap<RegionColumn, usize>,
     /// Stores the table fixed columns.
     table_columns: Vec<TableColumn>,
-    _marker: PhantomData<F>,
+    // /// Stores all static tables that will be resolved in keygen
+    // static_tables: Vec<(StaticTableId<String>, StaticTable<E>)>,
+    _marker: PhantomData<(E, F)>,
 }
 
-impl<'a, F: Field, CS: Assignment<F> + 'a> fmt::Debug for SingleChipLayouter<'a, F, CS> {
+impl<'a, E: MultiMillerLoop<Scalar = F>, F: Field, CS: Assignment<F, E = E> + 'a> fmt::Debug
+    for SingleChipLayouter<'a, E, F, CS>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SingleChipLayouter")
             //.field("regions", &self.regions)
@@ -59,7 +71,9 @@ impl<'a, F: Field, CS: Assignment<F> + 'a> fmt::Debug for SingleChipLayouter<'a,
     }
 }
 
-impl<'a, F: Field, CS: Assignment<F>> SingleChipLayouter<'a, F, CS> {
+impl<'a, E: MultiMillerLoop<Scalar = F>, F: Field, CS: Assignment<F, E = E>>
+    SingleChipLayouter<'a, E, F, CS>
+{
     /// Creates a new single-chip layouter.
     pub fn new(cs: &'a mut CS, constants: Vec<Column<Fixed>>) -> Result<Self, Error> {
         let ret = SingleChipLayouter {
@@ -68,14 +82,18 @@ impl<'a, F: Field, CS: Assignment<F>> SingleChipLayouter<'a, F, CS> {
             // regions: vec![],
             columns: FxHashMap::default(),
             table_columns: vec![],
+            // static_tables: vec![],
             _marker: PhantomData,
         };
         Ok(ret)
     }
 }
 
-impl<'a, F: Field, CS: Assignment<F> + 'a> Layouter<F> for SingleChipLayouter<'a, F, CS> {
+impl<'a, E: MultiMillerLoop<Scalar = F>, F: Field, CS: Assignment<F, E = E> + 'a> Layouter<F>
+    for SingleChipLayouter<'a, E, F, CS>
+{
     type Root = Self;
+    type E = E;
 
     fn assign_region<A, AR, N, NR>(&mut self, name: N, assignment: A) -> Result<AR, Error>
     where
@@ -202,6 +220,10 @@ impl<'a, F: Field, CS: Assignment<F> + 'a> Layouter<F> for SingleChipLayouter<'a
         Ok(())
     }
 
+    fn register_static_table(&mut self, id: StaticTableId<String>, table: StaticTable<E>) {
+        self.cs.register_static_table(id, table)
+    }
+
     fn constrain_instance(&mut self, cell: Cell, instance: Column<Instance>, row: usize) {
         self.cs.copy(
             cell.column,
@@ -232,15 +254,21 @@ impl<'a, F: Field, CS: Assignment<F> + 'a> Layouter<F> for SingleChipLayouter<'a
     }
 }
 
-struct SingleChipLayouterRegion<'r, 'a, F: Field, CS: Assignment<F> + 'a> {
-    layouter: &'r mut SingleChipLayouter<'a, F, CS>,
+struct SingleChipLayouterRegion<
+    'r,
+    'a,
+    E: MultiMillerLoop<Scalar = F>,
+    F: Field,
+    CS: Assignment<F, E = E> + 'a,
+> {
+    layouter: &'r mut SingleChipLayouter<'a, E, F, CS>,
     region_index: RegionIndex,
     /// Stores the constants to be assigned, and the cells to which they are copied.
     constants: Vec<(Assigned<F>, Cell)>,
 }
 
-impl<'r, 'a, F: Field, CS: Assignment<F> + 'a> fmt::Debug
-    for SingleChipLayouterRegion<'r, 'a, F, CS>
+impl<'r, 'a, E: MultiMillerLoop<Scalar = F>, F: Field, CS: Assignment<F, E = E> + 'a> fmt::Debug
+    for SingleChipLayouterRegion<'r, 'a, E, F, CS>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SingleChipLayouterRegion")
@@ -250,8 +278,10 @@ impl<'r, 'a, F: Field, CS: Assignment<F> + 'a> fmt::Debug
     }
 }
 
-impl<'r, 'a, F: Field, CS: Assignment<F> + 'a> SingleChipLayouterRegion<'r, 'a, F, CS> {
-    fn new(layouter: &'r mut SingleChipLayouter<'a, F, CS>, region_index: RegionIndex) -> Self {
+impl<'r, 'a, E: MultiMillerLoop<Scalar = F>, F: Field, CS: Assignment<F, E = E> + 'a>
+    SingleChipLayouterRegion<'r, 'a, E, F, CS>
+{
+    fn new(layouter: &'r mut SingleChipLayouter<'a, E, F, CS>, region_index: RegionIndex) -> Self {
         SingleChipLayouterRegion {
             layouter,
             region_index,
@@ -260,8 +290,8 @@ impl<'r, 'a, F: Field, CS: Assignment<F> + 'a> SingleChipLayouterRegion<'r, 'a, 
     }
 }
 
-impl<'r, 'a, F: Field, CS: Assignment<F> + 'a> RegionLayouter<F>
-    for SingleChipLayouterRegion<'r, 'a, F, CS>
+impl<'r, 'a, E: MultiMillerLoop<Scalar = F>, F: Field, CS: Assignment<F, E = E> + 'a>
+    RegionLayouter<F> for SingleChipLayouterRegion<'r, 'a, E, F, CS>
 {
     fn enable_selector<'v>(
         &'v mut self,
@@ -462,7 +492,7 @@ impl<'r, 'a, F: Field, CS: Assignment<F> + 'a> TableLayouter<F>
 
 #[cfg(test)]
 mod tests {
-    use halo2curves::pasta::vesta;
+    use halo2curves::bn256::{Bn256, Fr};
 
     use super::SimpleFloorPlanner;
     use crate::{
@@ -474,33 +504,26 @@ mod tests {
     fn not_enough_columns_for_constants() {
         struct MyCircuit {}
 
-        impl Circuit<vesta::Scalar> for MyCircuit {
+        impl Circuit<Bn256> for MyCircuit {
             type Config = Column<Advice>;
-            type FloorPlanner = SimpleFloorPlanner;
+            type FloorPlanner = SimpleFloorPlanner<Bn256>;
 
             fn without_witnesses(&self) -> Self {
                 MyCircuit {}
             }
 
-            fn configure(meta: &mut crate::plonk::ConstraintSystem<vesta::Scalar>) -> Self::Config {
+            fn configure(meta: &mut crate::plonk::ConstraintSystem<Fr>) -> Self::Config {
                 meta.advice_column()
             }
 
             fn synthesize(
                 &self,
                 config: Self::Config,
-                mut layouter: impl crate::circuit::Layouter<vesta::Scalar>,
+                mut layouter: impl crate::circuit::Layouter<Fr>,
             ) -> Result<(), crate::plonk::Error> {
                 layouter.assign_region(
                     || "assign constant",
-                    |mut region| {
-                        region.assign_advice_from_constant(
-                            || "one",
-                            config,
-                            0,
-                            vesta::Scalar::one(),
-                        )
-                    },
+                    |mut region| region.assign_advice_from_constant(|| "one", config, 0, Fr::one()),
                 )?;
 
                 Ok(())

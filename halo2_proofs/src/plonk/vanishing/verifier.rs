@@ -1,6 +1,8 @@
+use std::fmt::Debug;
 use std::iter;
 
 use ff::Field;
+use halo2curves::{pairing::MultiMillerLoop, serde::SerdeObject};
 
 use crate::{
     arithmetic::CurveAffine,
@@ -54,13 +56,19 @@ impl<C: CurveAffine> Argument<C> {
 
 impl<C: CurveAffine> Committed<C> {
     pub(in crate::plonk) fn read_commitments_after_y<
-        E: EncodedChallenge<C>,
-        T: TranscriptRead<C, E>,
+        E,
+        EC: EncodedChallenge<C>,
+        T: TranscriptRead<C, EC>,
     >(
         self,
-        vk: &VerifyingKey<C>,
+        vk: &VerifyingKey<E>,
         transcript: &mut T,
-    ) -> Result<Constructed<C>, Error> {
+    ) -> Result<Constructed<C>, Error>
+    where
+        E: MultiMillerLoop<G1Affine = C, Scalar = C::ScalarExt> + Debug,
+        E::G1Affine: SerdeObject,
+        E::G2Affine: SerdeObject,
+    {
         // Obtain a commitment to h(X) in the form of multiple pieces of degree n - 1
         let h_commitments = read_n_points(transcript, vk.domain.get_quotient_poly_degree())?;
 

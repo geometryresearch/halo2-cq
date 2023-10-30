@@ -345,11 +345,15 @@ pub fn compute_inner_product<F: Field>(a: &[F], b: &[F]) -> F {
 
 /// Divides polynomial `a` in `X` by `X - b` with
 /// no remainder.
-pub fn kate_division<'a, F: Field, I: IntoIterator<Item = &'a F>>(a: I, mut b: F) -> Vec<F>
+///
+/// a(b) = eval
+/// q = (a - eval) / (X - b)
+pub fn kate_division<'a, F: Field, I: Clone + IntoIterator<Item = &'a F>>(a: I, mut b: F) -> Vec<F>
 where
     I::IntoIter: DoubleEndedIterator + ExactSizeIterator,
 {
     b = -b;
+    let mut a_tmp: Vec<_> = a.clone().into_iter().cloned().collect();
     let a = a.into_iter();
 
     let mut q = vec![F::zero(); a.len() - 1];
@@ -361,6 +365,22 @@ where
         *q = lead_coeff;
         tmp = lead_coeff;
         tmp.mul_assign(&b);
+    }
+
+    // KATE SANITY CHECK
+    {
+        // Note: b = -b
+        let eval: F = eval_polynomial(&a_tmp, -b);
+        a_tmp[0] -= eval;
+        // Note: b = -b
+        let scaled = q.iter().map(|&q| q * b).chain(Some(F::zero()));
+        let shifted = std::iter::once(F::zero()).chain(q.iter().cloned());
+
+        let coeffs_back = scaled.zip(shifted).map(|(a, b)| a + b);
+
+        for (lhs, rhs) in coeffs_back.zip(a_tmp.into_iter()) {
+            assert_eq!(lhs, rhs);
+        }
     }
 
     q
